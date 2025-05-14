@@ -10,17 +10,20 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from time import mktime
 from pydantic import ValidationError, HttpUrl
-import bson # Import bson to catch specific errors
 import pandas as pd
 
-from .database import db_handler, Database
-from .models import ArticleModel
+# --- Import SQLAlchemy specific components ---
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from .database import async_session_factory, create_article_if_not_exists # Import session factory and create function
+# Keep models import for extract_article_data potentially
+from .models import ArticleModel # Keep for type hints if needed, but primary interaction is dicts now
 from .config import settings
 
+# --- Logging, constants, flatten_feed_config, fetch_feed_content, parse_feed_data remain the same ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-header = ['Source', 'Headline', 'URL'] # Define header row
-unique_field = 'URL' # Define the fieldname used for deduplication
+header = ['source', 'headline', 'url'] # Define header row
+unique_field = 'url' # Define the fieldname used for deduplication
 
 DEFAULT_HTTP_TIMEOUT = 15.0 # Timeout for fetching feeds in seconds
 
@@ -62,9 +65,9 @@ def flatten_feed_config(nested_config: List[Dict[str, Any]]) -> List[Dict[str, A
                 if url and isinstance(url, str): # Ensure URL is a non-empty string
                     flat_list.append({
                         "url": url.strip(),
-                        "newsOutlet": source_name.strip(),
-                        "feedCategory": category_name.strip(),
-                        "newsOutletLogo": source_logo # Keep as string path/identifier
+                        "news_outlet": source_name.strip(),
+                        "feed_category": category_name.strip(),
+                        "news_outlet_logo": source_logo # Keep as string path/identifier
                     })
                 else:
                      logger.warning(f"Skipping invalid URL entry '{url}' for source '{source_name}'.")
@@ -72,7 +75,7 @@ def flatten_feed_config(nested_config: List[Dict[str, Any]]) -> List[Dict[str, A
     logger.info(f"Successfully transformed {len(flat_list)} feed URLs from configuration.")
     return flat_list
 
-# --- Functions fetch_feed_content, parse_feed_data remain the same ---
+
 async def fetch_feed_content(url: str, client: httpx.AsyncClient) -> Optional[str]:
     """Fetches raw content from a given URL asynchronously."""
     try:
@@ -91,6 +94,7 @@ async def fetch_feed_content(url: str, client: httpx.AsyncClient) -> Optional[st
         logger.error(f"Unexpected error fetching {url}: {e}")
     return None
 
+
 def parse_feed_data(feed_content: str, feed_url: str) -> Optional[feedparser.FeedParserDict]:
     """Parses feed content using feedparser."""
     try:
@@ -108,7 +112,8 @@ def parse_feed_data(feed_content: str, feed_url: str) -> Optional[feedparser.Fee
     return None
 
 
-# --- Function extract_article_data remains mostly the same ---
+# --- extract_article_data remains the same ---
+# It should return a dictionary compatible with create_article_if_not_exists
 # IMPORTANT: Ensure ArticleModel's newsOutletLogo field accepts Optional[str]
 # as the config provides paths like "/images/logos/...", not full URLs.
 # If ArticleModel expects HttpUrl, Pydantic validation will fail here.
@@ -149,18 +154,31 @@ def extract_article_data(entry: feedparser.FeedParserDict, feed_config: Dict[str
                     image_url = l.get("href")
                     break
 
+        # ... after extracting other fields ...
+        categories_from_feed = None
+        if hasattr(entry, 'tags') and entry.tags:
+            # Get the 'term' from the first tag, if available
+            first_tag = entry.tags[0]
+            if isinstance(first_tag, dict) and 'term' in first_tag:
+                # Get all tags
+                categories_from_feed = ", ".join([tag.get('term') for tag in entry.tags if tag.get('term')])
+
         article_dict = {
             "title": title.strip(),
             "link": link.strip(),
-            "pubDate": dt_obj,
+            "pub_date": dt_obj,
+            "category": categories_from_feed,
             "description": description.strip() if description else None,
             "content": content.strip() if content else None,
             "author": author.strip() if author else "Unknown",
-            "newsOutlet": feed_config["newsOutlet"],
-            "newsOutletLogo": feed_config.get("newsOutletLogo"), # Pass the string path/identifier
-            "feedCategory": feed_config["feedCategory"],
-            "imageUrl": image_url.strip() if image_url else None,
+            "news_outlet": feed_config["news_outlet"],
+            "news_outlet_logo": feed_config.get("news_outlet_logo"), # Pass the string path/identifier
+            "feed_category": feed_config["feed_category"],
+            "image_url": image_url.strip() if image_url else None,
         }
+
+        print(f"DEBUG: Extracted data: {article_dict}")
+
         return article_dict
 
     except Exception as e:
@@ -168,131 +186,78 @@ def extract_article_data(entry: feedparser.FeedParserDict, feed_config: Dict[str
         logger.exception(f"Error processing entry '{entry_title}' from {feed_config['url']}: {e}") # Use logger.exception for traceback
         return None
 
-# --- Updated store_article ---
-async def store_article(article_data: Dict[str, Any], db: Database) -> Tuple[bool, Optional[Dict[str, str]]]:
+
+async def process_single_feed(
+    feed_config: Dict[str, Any],
+    client: httpx.AsyncClient,
+    # Session factory passed for background task session management
+    session_factory: async_sessionmaker[AsyncSession]
+) -> List[Dict[str, str]]:
     """
-    Stores a single article in the database using upsert.
-    Converts HttpUrl fields to strings before database operation.
-
-    Returns:
-        Tuple[bool, Optional[Dict[str, str]]]:
-        - bool: True if article was newly inserted, False otherwise.
-        - Optional[Dict]: If inserted, a dict containing {'source': ..., 'headline': ..., 'url': ...}, else None.
-    """
-    article_title = article_data.get("title", "Unknown Title")
-    try:
-        article = ArticleModel(**article_data)
-        article_db_data = article.model_dump(by_alias=True, exclude={'id'})
-        link_str = str(article.link) # Use string for query and potentially for return dict
-
-        # Convert HttpUrl types to strings for BSON encoding
-        link_key = ArticleModel.model_fields['link'].alias or 'link'
-        if link_key in article_db_data and isinstance(article_db_data[link_key], HttpUrl):
-             article_db_data[link_key] = str(article_db_data[link_key])
-        img_url_key = ArticleModel.model_fields['image_url'].alias or 'imageUrl'
-        if img_url_key in article_db_data and article_db_data[img_url_key] is not None and isinstance(article_db_data[img_url_key], HttpUrl):
-             article_db_data[img_url_key] = str(article_db_data[img_url_key])
-        logo_key = ArticleModel.model_fields['news_outlet_logo'].alias or 'newsOutletLogo'
-        if logo_key in article_db_data and article_db_data[logo_key] is not None and isinstance(article_db_data[logo_key], HttpUrl):
-            article_db_data[logo_key] = str(article_db_data[logo_key])
-
-        if db.articles_collection is None:
-             logger.error("Database collection not available. Cannot store article.")
-             # Return False and None for the article info dict
-             return False, None
-
-        result = await db.articles_collection.update_one(
-            {"link": link_str},
-            {"$setOnInsert": article_db_data},
-            upsert=True
-        )
-
-        if result.upserted_id:
-            logger.info(f"Inserted new article: '{article_title}'")
-            # Return True and the required info dict
-            article_info = {
-                "source": article.news_outlet, # Use field name from Pydantic model
-                "headline": article.title,
-                "url": link_str # Use the string version of the link
-            }
-            return True, article_info
-        elif result.matched_count > 0:
-            logger.debug(f"Article already exists (link match): '{article_title}'")
-            return False, None
-        else:
-            logger.warning(f"Upsert operation reported no match and no upsert for: '{article_title}'")
-            return False, None
-
-    except ValidationError as e:
-        logger.error(f"Data validation failed for article '{article_title}': {e}")
-    except Exception as e:
-        if isinstance(e, bson.errors.InvalidDocument):
-             logger.exception(f"BSON Encoding Error storing article '{article_title}': {e} - Data: {article_db_data}")
-        else:
-             logger.exception(f"Database error storing article '{article_title}': {e}")
-
-    # Return False and None in case of errors
-    return False, None
-
-# --- Updated process_single_feed ---
-async def process_single_feed(feed_config: Dict[str, Any], client: httpx.AsyncClient, db: Database) -> List[Dict[str, str]]:
-    """
-    Fetches, parses, and stores articles for a single feed configuration.
-    Returns a list of dictionaries, each containing info for newly added articles.
+    Fetches, parses, and attempts to store articles for a single feed.
+    Manages its own database session scope.
+    Returns info for newly added articles.
     """
     feed_url = feed_config["url"]
-    logger.info(f"Processing feed: {feed_url} ({feed_config['newsOutlet']})")
-    # Changed list name and type hint
+    logger.info(f"Processing feed: {feed_url} ({feed_config['news_outlet']})")
     added_articles_info: List[Dict[str, str]] = []
 
     content = await fetch_feed_content(feed_url, client)
-    if not content:
-        return added_articles_info
+    if not content: return added_articles_info
 
     parsed_feed = parse_feed_data(content, feed_url)
-    if not parsed_feed or not parsed_feed.entries:
-        return added_articles_info
+    if not parsed_feed or not parsed_feed.entries: return added_articles_info
 
     logger.debug(f"Found {len(parsed_feed.entries)} entries in {feed_url}")
 
     added_count = 0
-    skipped_count = 0
+    existing_count = 0
     error_count = 0
+    skipped_count = 0
     processed_count = 0
 
-    tasks = []
-    for entry in parsed_feed.entries:
-        article_data = extract_article_data(entry, feed_config)
-        if article_data:
-            tasks.append(store_article(article_data, db))
-        else:
-            skipped_count += 1
+    # Create a session scope for this feed's processing
+    async with session_factory() as session:
+        for entry in parsed_feed.entries:
+            processed_count += 1
+            article_data = extract_article_data(entry, feed_config)
+            if article_data:
+                try:
+                    # Use the function to create if not exists
+                    # Pass the session and article data dictionary
+                    created_article = await create_article_if_not_exists(session, article_data)
 
-    storage_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    if created_article:
+                        # Article was newly inserted
+                        added_count += 1
+                        added_articles_info.append({
+                            "source": created_article.news_outlet,
+                            "headline": created_article.title,
+                            "author": created_article.author,
+                            "description": created_article.description,
+                            "content": created_article.content,
+                            "url": created_article.link # URL is now string from DB model,
+                        })
+                    else:
+                        # Article already existed
+                        existing_count += 1
+                except Exception as e:
+                    error_count += 1
+                    # logger.error(f"Error processing article '{article_data.get('title', 'N/A')}': {e}", exc_info=True)
+                    # Make this error super visible
+                    logger.error(f"!!!!! EXCEPTION caught in process_single_feed loop for article '{article_data.get('title', 'N/A')}': {e}", exc_info=True)
+                    print(f"DEBUG !!!!! EXCEPTION in loop for '{article_data.get('title', 'N/A')}': {e}") # Temporary Print
+            else:
+                skipped_count += 1 # Extract failed
 
-    for result in storage_results:
-        processed_count += 1
-        if isinstance(result, Exception):
-            logger.error(f"Caught exception during article storage for feed {feed_url}: {result}")
-            error_count += 1
-        elif isinstance(result, tuple) and len(result) == 2: # Check tuple structure
-            was_added, article_info = result
-            if was_added and article_info is not None: # Check if info dict is returned
-                added_count += 1
-                # Append the dictionary, not just the headline
-                added_articles_info.append(article_info)
-        else:
-             logger.warning(f"Unexpected result type/structure from store_article for feed {feed_url}: {type(result)} / {result}")
-             error_count +=1
-
-    existing_count = processed_count - added_count - error_count
-    logger.info(f"Finished processing {feed_url}. Added: {added_count}, Existing: {existing_count}, Skipped/Invalid: {skipped_count}, Errors: {error_count}")
-    # Return the list of info dictionaries
+    # Logging outside the session block
+    logger.info(f"Finished processing {feed_url}. Added: {added_count}, Existing: {existing_count}, Errors: {error_count}, Skipped/Invalid: {skipped_count}")
     return added_articles_info
 
 
+# --- save_articles_info_to_csv using Pandas remains the same ---
 # --- Audited pandas-based save_articles_info_to_csv ---
-def save_articles_info_to_csv(articles_info: List[Dict[str, str]], filename: str = "rss_feed_entries.csv"):
+def save_articles_info_to_csv(articles_info: List[Dict[str, str]], filename: str = "rss_feed_data.csv"):
     """
     Appends information about newly processed articles (Source, Headline, URL)
     to a CSV file using pandas, avoiding duplicate entries based on the URL.
@@ -379,25 +344,23 @@ def save_articles_info_to_csv(articles_info: List[Dict[str, str]], filename: str
 
 
 # --- Updated process_all_feeds ---
-async def process_all_feeds(db: Database, feed_list: List[Dict[str, Any]], csv_filename: str = "rss_feed_entries.csv"):
+async def process_all_feeds(
+    # Removed 'db' argument, now uses session factory
+    session_factory: async_sessionmaker[AsyncSession],
+    feed_list: List[Dict[str, Any]],
+    csv_filename: str = "rss_feed_data.csv"
+):
     """
     Main orchestrator function to process all configured RSS feeds.
-
-    Args:
-        db: Connected Database instance.
-        feed_list: A FLAT list of feed configuration dictionaries,
-                   where each dict represents one URL.
-        csv_filename: Name of the output CSV file for headlines.
+    Uses the provided session factory to manage sessions for sub-tasks.
     """
-    #if not db or not db.client or not db.articles_collection:
-    if db is None or db.client is None or db.articles_collection is None:
-        logger.error("Database connection is not available. Aborting feed processing.")
+    if session_factory is None:
+        logger.error("Session factory not available. Aborting feed processing.")
         return
     if not feed_list:
         logger.warning("Received an empty feed list to process. Aborting.")
         return
 
-    # Changed list name and type hint
     all_new_articles_info: List[Dict[str, str]] = []
     total_feeds = len(feed_list)
     processed_feeds = 0
@@ -406,7 +369,8 @@ async def process_all_feeds(db: Database, feed_list: List[Dict[str, Any]], csv_f
     logger.info(f"Starting processing for {total_feeds} feed URLs...")
 
     async with httpx.AsyncClient() as client:
-        tasks = [process_single_feed(feed_config, client, db) for feed_config in feed_list]
+        # Pass the session factory to each task
+        tasks = [process_single_feed(feed_config, client, session_factory) for feed_config in feed_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for i, result in enumerate(results):
@@ -434,11 +398,21 @@ async def process_all_feeds(db: Database, feed_list: List[Dict[str, Any]], csv_f
 
 
 # --- Standalone Execution Example (main function) ---
+# This needs significant changes as it now relies on SQLAlchemy setup
 async def main():
-    """Main function for standalone execution and testing."""
+    """Main function for standalone execution - Primarily for setup/utility now."""
     logger.info("Starting standalone RSS processor execution...")
+    logger.warning("Standalone mode may not have full application context (e.g., scheduler).")
+
+    # We need the session factory for process_all_feeds
+    if async_session_factory is None:
+         logger.critical("Cannot run standalone: Database session factory not initialized.")
+         return
+
     try:
-        await db_handler.connect_db()
+        # Optionally create tables if in dev environment (USE WITH CAUTION)
+        # await create_db_and_tables() # Uncomment carefully for initial setup
+
         logger.info("Loading and transforming feed configuration from settings...")
         feed_list_to_process = flatten_feed_config(settings.rss_feeds)
 
@@ -446,27 +420,40 @@ async def main():
             logger.warning("No processable feed URLs found in configuration. Exiting.")
             return
 
-        # Use the updated default CSV filename or pass explicitly
+        # Run the feed processing, passing the session factory
         await process_all_feeds(
-            db=db_handler,
+            session_factory=async_session_factory,
             feed_list=feed_list_to_process,
-            csv_filename="output_articles_added.csv" # Example of explicit filename
+            csv_filename=settings.CSV_OUTPUT_FILENAME
         )
 
     except Exception as e:
         logger.exception(f"An error occurred during standalone execution: {e}")
     finally:
-        await db_handler.close_db()
+        # Clean up the engine if it was created (update: commented out due to error)
+        # if async_engine:
+        #     logger.info("Closing SQLAlchemy engine.")
+        #     await async_engine.dispose()
         logger.info("Standalone RSS processor finished.")
 
 
 if __name__ == "__main__":
+    # Ensure environment variables are loaded if using .env for config
     from dotenv import load_dotenv
+    import asyncio # Ensure asyncio is imported here if not already top-level
+    # Make sure settings is imported if not already top-level in this file scope
+    # (It should be imported at the top already)
+    # from .config import settings
+
     load_dotenv()
 
-    if not settings.MONGO_URI or "localhost" in settings.MONGO_URI:
-        print("\nWARNING: MONGO_URI environment variable not set or points to localhost.")
-        print("Ensure MongoDB is running and accessible, or set MONGO_URI in your environment/.env file.")
+    # --- CORRECTED CHECK: Use DATABASE_URL ---
+    # Check if DATABASE_URL seems correctly set (basic check)
+    if not settings.DATABASE_URL or "localhost" in settings.DATABASE_URL:
+        print("\nWARNING: DATABASE_URL environment variable not set or points to localhost.")
+        print("Ensure it's set in your .env file and points to your Supabase test instance.")
+        # Depending on requirements, you might exit here or proceed cautiously
+        # exit(1)
 
     # Important Check: Ensure the rss_feeds setting is actually loaded
     if not settings.rss_feeds:
@@ -474,4 +461,5 @@ if __name__ == "__main__":
          print("Please check your config.py and environment variables/defaults.")
          # exit(1) # Optionally exit if config is crucial
 
+    # Run the async main function for standalone execution
     asyncio.run(main())
